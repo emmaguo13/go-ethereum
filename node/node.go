@@ -62,8 +62,9 @@ type Node struct {
 	wsAuth        *httpServer //
 	ipc           *ipcServer  // Stores information about the ipc http server
 	inprocHandler *rpc.Server // In-process RPC request handler to process the API requests
-
-	databases map[*closeTrackingDB]struct{} // All open databases
+	readOnly      bool
+	localLib      bool
+	databases     map[*closeTrackingDB]struct{} // All open databases
 }
 
 const (
@@ -71,6 +72,10 @@ const (
 	runningState
 	closedState
 )
+
+func (n *Node) ReadOnly() bool {
+	return n.readOnly
+}
 
 // New creates a new P2P node, ready for protocol registration.
 func New(conf *Config) (*Node, error) {
@@ -109,42 +114,57 @@ func New(conf *Config) (*Node, error) {
 		stop:          make(chan struct{}),
 		server:        &p2p.Server{Config: conf.P2P},
 		databases:     make(map[*closeTrackingDB]struct{}),
+		readOnly:      conf.ReadOnly,
+		localLib:      conf.LocalLib,
 	}
 
 	// Register built-in APIs.
 	node.rpcAPIs = append(node.rpcAPIs, node.apis()...)
 
 	// Acquire the instance directory lock.
-	if err := node.openDataDir(); err != nil {
-		return nil, err
+	if !node.readOnly {
+		if err := node.openDataDir(); err != nil {
+			return nil, err
+		}
+		keyDir, isEphem, err := getKeyStoreDir(conf)
+		if err != nil {
+			return nil, err
+		}
+		node.keyDir = keyDir
+		node.keyDirTemp = isEphem
 	}
-	keyDir, isEphem, err := getKeyStoreDir(conf)
-	if err != nil {
-		return nil, err
-	}
-	node.keyDir = keyDir
-	node.keyDirTemp = isEphem
+
 	// Creates an empty AccountManager with no backends. Callers (e.g. cmd/geth)
 	// are required to add the backends later on.
 	node.accman = accounts.NewManager(&accounts.Config{InsecureUnlockAllowed: conf.InsecureUnlockAllowed})
+	if !node.readOnly {
+		// Initialize the p2p server. This creates the node key and discovery databases.
+		node.server.Config.PrivateKey = node.config.NodeKey()
+		node.server.Config.Name = node.config.NodeName()
+		node.server.Config.Logger = node.log
+		if node.server.Config.StaticNodes == nil {
+			node.server.Config.StaticNodes = node.config.StaticNodes()
+		}
+		if node.server.Config.TrustedNodes == nil {
+			node.server.Config.TrustedNodes = node.config.TrustedNodes()
+		}
+		if node.server.Config.NodeDatabase == "" {
+			node.server.Config.NodeDatabase = node.config.NodeDB()
+		}
+	}
+	if !node.localLib {
+		// Check HTTP/WS prefixes are valid.
+		if err := validatePrefix("HTTP", conf.HTTPPathPrefix); err != nil {
+			return nil, err
+		}
+		if err := validatePrefix("WebSocket", conf.WSPathPrefix); err != nil {
+			return nil, err
+		}
 
-	// Initialize the p2p server. This creates the node key and discovery databases.
-	node.server.Config.PrivateKey = node.config.NodeKey()
-	node.server.Config.Name = node.config.NodeName()
-	node.server.Config.Logger = node.log
-	if node.server.Config.StaticNodes == nil {
-		node.server.Config.StaticNodes = node.config.StaticNodes()
-	}
-	if node.server.Config.TrustedNodes == nil {
-		node.server.Config.TrustedNodes = node.config.TrustedNodes()
-	}
-	if node.server.Config.NodeDatabase == "" {
-		node.server.Config.NodeDatabase = node.config.NodeDB()
-	}
-
-	// Check HTTP/WS prefixes are valid.
-	if err := validatePrefix("HTTP", conf.HTTPPathPrefix); err != nil {
-		return nil, err
+		// Configure RPC servers.
+		node.http = newHTTPServer(node.log, conf.HTTPTimeouts)
+		node.ws = newHTTPServer(node.log, rpc.DefaultHTTPTimeouts)
+		node.ipc = newIPCServer(node.log, conf.IPCEndpoint())
 	}
 	if err := validatePrefix("WebSocket", conf.WSPathPrefix); err != nil {
 		return nil, err
@@ -268,9 +288,11 @@ func (n *Node) doClose(errs []error) error {
 // openEndpoints starts all network and RPC endpoints.
 func (n *Node) openEndpoints() error {
 	// start networking endpoints
-	n.log.Info("Starting peer-to-peer node", "instance", n.server.Name)
-	if err := n.server.Start(); err != nil {
-		return convertFileLockError(err)
+	if !n.readOnly {
+		n.log.Info("Starting peer-to-peer node", "instance", n.server.Name)
+		if err := n.server.Start(); err != nil {
+			return convertFileLockError(err)
+		}
 	}
 	// start RPC endpoints
 	err := n.startRPC()
@@ -383,7 +405,17 @@ func (n *Node) startRPC() error {
 	if err := n.startInProc(); err != nil {
 		return err
 	}
+	if n.localLib {
+		return nil
+	} else {
+		return n.startExternalRPC()
+	}
+}
 
+// configureRPC is a helper method to configure all the various RPC endpoints during node
+// startup. It's not meant to be called at any time afterwards as it makes certain
+// assumptions about the state of the node.
+func (n *Node) startExternalRPC() error {
 	// Configure IPC.
 	if n.ipc.endpoint != "" {
 		if err := n.ipc.start(n.rpcAPIs); err != nil {
@@ -490,7 +522,8 @@ func (n *Node) startRPC() error {
 			return err
 		}
 	}
-	return nil
+	return n.ws.start()
+
 }
 
 func (n *Node) wsServerForPort(port int, authenticated bool) *httpServer {
@@ -505,12 +538,18 @@ func (n *Node) wsServerForPort(port int, authenticated bool) *httpServer {
 }
 
 func (n *Node) stopRPC() {
+	if !n.localLib {
+		n.stopExternalRPC()
+	}
+	n.stopInProc()
+}
+
+func (n *Node) stopExternalRPC() {
 	n.http.stop()
 	n.ws.stop()
 	n.httpAuth.stop()
 	n.wsAuth.stop()
 	n.ipc.stop()
-	n.stopInProc()
 }
 
 // startInProc registers all RPC APIs on the inproc server.

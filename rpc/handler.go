@@ -92,6 +92,10 @@ func newHandler(connCtx context.Context, conn jsonWriter, idgen func() ID, reg *
 	return h
 }
 
+func NewHandler(connCtx context.Context, conn jsonWriter, reg *serviceRegistry) *handler {
+	return newHandler(connCtx, conn, randomIDGenerator(), reg)
+}
+
 // handleBatch executes all messages in a batch and returns the responses.
 func (h *handler) handleBatch(msgs []*jsonrpcMessage) {
 	// Emit error response for empty batches:
@@ -116,7 +120,7 @@ func (h *handler) handleBatch(msgs []*jsonrpcMessage) {
 	h.startCallProc(func(cp *callProc) {
 		answers := make([]*jsonrpcMessage, 0, len(msgs))
 		for _, msg := range calls {
-			if answer := h.handleCallMsg(cp, msg); answer != nil {
+			if answer := h.HandleCallMsg(cp, msg); answer != nil {
 				answers = append(answers, answer)
 			}
 		}
@@ -130,13 +134,18 @@ func (h *handler) handleBatch(msgs []*jsonrpcMessage) {
 	})
 }
 
+func DefaultCallProc() *callProc {
+	cproc := &callProc{ctx: context.Background(), notifiers: make([]*Notifier, 0)}
+	return cproc
+}
+
 // handleMsg handles a single message.
 func (h *handler) handleMsg(msg *jsonrpcMessage) {
 	if ok := h.handleImmediate(msg); ok {
 		return
 	}
 	h.startCallProc(func(cp *callProc) {
-		answer := h.handleCallMsg(cp, msg)
+		answer := h.HandleCallMsg(cp, msg)
 		h.addSubscriptions(cp.notifiers)
 		if answer != nil {
 			h.conn.writeJSON(cp.ctx, answer)
@@ -313,6 +322,10 @@ func (h *handler) handleCallMsg(ctx *callProc, msg *jsonrpcMessage) *jsonrpcMess
 	default:
 		return errorMessage(&invalidRequestError{"invalid request"})
 	}
+}
+
+func (h *handler) HandleCallMsg(ctx *callProc, msg *jsonrpcMessage) *jsonrpcMessage {
+	return h.handleCallMsg(ctx, msg)
 }
 
 // handleCall processes method calls.

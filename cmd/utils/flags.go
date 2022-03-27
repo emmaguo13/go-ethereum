@@ -1793,7 +1793,8 @@ func SetDNSDiscoveryDefaults(cfg *ethconfig.Config, genesis common.Hash) {
 // RegisterEthService adds an Ethereum client to the stack.
 // The second return value is the full node instance, which may be nil if the
 // node is running as a light client.
-func RegisterEthService(stack *node.Node, cfg *ethconfig.Config) (ethapi.Backend, *eth.Ethereum) {
+// TODO: can get rid of isCatalyst for cleaner code tbh
+func RegisterEthService(stack *node.Node, cfg *ethconfig.Config, isCatalyst bool) (ethapi.Backend, *eth.Ethereum) {
 	if cfg.SyncMode == downloader.LightSync {
 		backend, err := les.New(stack, cfg)
 		if err != nil {
