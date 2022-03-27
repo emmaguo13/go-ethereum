@@ -204,6 +204,8 @@ type Config struct {
 
 	// JWTSecret is the hex-encoded jwt secret.
 	JWTSecret string `toml:",omitempty"`
+	ReadOnly            bool
+	LocalLib            bool
 }
 
 // IPCEndpoint resolves an IPC endpoint based on a configured value, taking into
@@ -354,6 +356,9 @@ func (c *Config) instanceDir() string {
 	if c.DataDir == "" {
 		return ""
 	}
+	// if c.ReadOnly {
+	// 	return filepath.Join(c.DataDir, "geth")
+	// }
 	return filepath.Join(c.DataDir, c.name())
 }
 
